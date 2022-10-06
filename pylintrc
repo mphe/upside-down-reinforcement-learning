@@ -1,0 +1,26 @@
+[MASTER]
+init-hook="from pylint.config import find_pylintrc; import os, sys; sys.path.append(os.path.dirname(find_pylintrc()))"
+jobs=0
+
+[TYPECHECK]
+ignored-modules=pyglet,gym,numpy
+generated-members=torch
+
+[MESSAGES CONTROL]
+disable=C,
+      too-many-instance-attributes,
+      too-few-public-methods,
+      too-many-branches,
+      too-many-arguments,
+      too-many-locals,
+      global-statement,
+      useless-object-inheritance,
+      try-except-raise,
+      broad-except,
+      protected-access,
+      chained-comparison
+
+[REPORTS]
+output-format=colorized
+
+# vim: ft=conf

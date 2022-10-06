@@ -1,0 +1,8 @@
+{
+  "include": [
+    "src"
+  ],
+  "reportGeneralTypeIssues": false,
+  "reportOptionalMemberAccess": false,
+  "reportOptionalSubscript": false
+}
