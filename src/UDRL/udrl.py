@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-# Original source: https://github.com/BY571/Upside-Down-Reinforcement-Learning/blob/f27215bb6bc487d6f587706432373e88f6a07091/Upside-Down.ipynb
-
 import logging
-from typing import Any, Dict, Optional, List, Union, Callable, Tuple
+from typing import Any, Dict, Optional, List, Union, Callable
 import numpy as np
 import gym
 import torch
@@ -12,21 +10,19 @@ import torch.nn.functional as F
 from torch import Tensor, optim
 from torch.utils.data import DataLoader
 from dataclasses import dataclass
-from stable_baselines3.common.preprocessing import is_image_space, maybe_transpose, preprocess_obs
-from stable_baselines3.common.utils import is_vectorized_observation, obs_as_tensor
-from stable_baselines3.common.vec_env.vec_transpose import VecTransposeImage
-# from stable_baselines3.common.base_class import BaseAlgorithm
-import copy
+from stable_baselines3.common.base_class import BaseAlgorithm
+from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvObs
 import tqdm
 
 from .behavior import UDRLBehaviorCNN
-from .replay_buffer import ReplayBuffer
+from .replay_buffer import ReplayBuffer, Trajectory
 from .dataset import UDRLDataset
+from .preprocessing import Preprocessor
+
+EnvStepCallback = Callable[[Dict[str, Any], Dict[str, Any]], Any]
 
 # mypy complains about np.floating not being compatible to basic python floats
 Float = Union[float, np.floating]
-
-EnvStepCallback = Callable[[Dict[str, Any], Dict[str, Any]], Any]
 
 
 @dataclass
@@ -43,6 +39,9 @@ class Command:
         if max_reward is not None:
             self.reward = min(self.reward, max_reward)
         self.horizon = max(self.horizon - 1, 1)
+
+    def duplicate(self) -> "Command":
+        return Command(self.reward, self.horizon)
 
 
 @dataclass
@@ -74,7 +73,7 @@ class TrainStats:
 
 class UDRL:
     def __init__(self,
-                 env: gym.Env,
+                 env: Union[gym.Env, VecEnv],
                  horizon_scale: float = 0.02,
                  return_scale: float = 0.02,
                  replay_size: int = 700,
@@ -98,38 +97,37 @@ class UDRL:
 
         if not device:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
         self._device = torch.device(device)
 
-        self._env = env
-        self._obs_space: gym.spaces.Space = VecTransposeImage.transpose_space(self._env.observation_space)
-        logging.debug("Observation space: %s", self._obs_space.shape)
+        # Transform the environment to a vectorized environment and wrap VecTransposeImage for image observations
+        self._env: VecEnv = BaseAlgorithm._wrap_env(env, verbose=1)
 
-        # TODO: Support vectorized environments and wrap environment
-        # self._env = BaseAlgorithm._wrap_env(self._env, verbose=1)
+        obs_space: gym.spaces.Space = self._env.observation_space
+        logging.debug("Observation space: %s", obs_space.shape)
 
         policy_kwargs = {} if policy_kwargs is None else {}
-        self._behavior = UDRLBehaviorCNN(self._obs_space, env.action_space, **policy_kwargs).to(self._device)
+        self._behavior = UDRLBehaviorCNN(obs_space, env.action_space, **policy_kwargs).to(self._device)
         self._optimizer = optim.Adam(params=self._behavior.parameters())
         self._replay_buffer = ReplayBuffer(self._replay_size)
+        self._preprocessor = Preprocessor(obs_space)
 
+        # This is set in _sample_exploratory_command()
         self._evaluation_command: Command = Command(1.0, 1)
 
     def learn(self, max_iterations: int, skip_warmup: bool = False, env_step_callback: Optional[EnvStepCallback] = None) -> TrainStats:
         if not skip_warmup:
             logging.info("Warm up for %s episodes...", self._n_warm_up_episodes)
-            for _ in tqdm.trange(self._n_warm_up_episodes):
-                self._generate_episode(use_bf=False, add_to_replay_buffer=True,
-                                       env_step_callback=env_step_callback)
+            self._generate_episodes(self._n_warm_up_episodes, use_bf=False,
+                                    add_to_replay_buffer=True, env_step_callback=env_step_callback)
 
         return self._run_upside_down(max_iterations, env_step_callback)
 
-    def action(self, obs: np.ndarray, command: Command, deterministic: bool = False) -> np.ndarray:
-        """Randomly samples actions based on their predicted probabilities for the given observation
-        and command. If deterministic is True, it returns the most likely action."""
-        return self._action(self._preprocess_state_to_tensor(obs),
-                            self._create_command_tensor(command),
-                            deterministic).cpu().numpy()
+    def action(self, obs: np.ndarray, commands: List[Command], deterministic: bool = False) -> np.ndarray:
+        """Returns actions based on their predicted probabilities for the given observations and
+        commands. If deterministic is True, it returns the most likely actions."""
+        return self._behavior.action(self._preprocessor.transform(obs),
+                                     self._create_vec_command_tensor(commands),
+                                     deterministic).cpu().squeeze().float().numpy()
 
     def save(self, fname: str) -> None:
         torch.save(self._behavior.state_dict(), fname)
@@ -194,55 +192,88 @@ class UDRL:
 
         return Command(new_desired_reward, new_desired_horizon)
 
-    def _generate_episode(self, use_bf: bool, add_to_replay_buffer: bool,
-                          command: Optional[Command] = None,
-                          env_step_callback: Optional[EnvStepCallback] = None) -> float:
-        """Plays an episode using random actions or the behavior function and adds it to the replay buffer."""
-        # NOTE: This function got a bit large and a little complicated, but its the only reasonable
-        # way to not have high amounts of code duplication that I can think of at the moment.
-        states: List[Tensor] = []
-        actions: List[Tensor] = []
-        rewards: List[float] = []
+    def _evaluate(self, env_step_callback: Optional[EnvStepCallback] = None) -> float:
+        return self._generate_episodes(1, True, False, self._evaluation_command, env_step_callback)[0]
 
-        state: Tensor = self._preprocess_state_to_tensor(self._env.reset())
-        action: Tensor
-        summed_reward: float = 0.0
+    def _generate_episodes(self, num: int, use_bf: bool, add_to_replay_buffer: bool,
+                           command: Optional[Command] = None,
+                           env_step_callback: Optional[EnvStepCallback] = None) -> List[float]:
+        """Plays N episodes using random actions or the behavior function and optionally adds it to the replay buffer."""
+        # NOTE: This function got a bit large and complicated, but it's still more clear and
+        # readable than any attempts of refactoring it.
 
-        if use_bf and command is None:
-            command = self._sample_exploratory_command()
+        actions_out: Tensor
+        commands: List[Command] = []
+        traj_states: List[List[Tensor]] = [ [] for _ in range(self._env.num_envs) ]
+        traj_actions: List[List[Tensor]] = [ [] for _ in range(self._env.num_envs) ]
+        traj_rewards: List[List[float]] = [ [] for _ in range(self._env.num_envs) ]
+        summed_rewards: List[float] = []
+        progress: Optional[tqdm.tqdm] = tqdm.tqdm(total=num) if num > 1 else None
+
+        # Initialize commands
+        if use_bf:
+            if command is None:
+                command = self._sample_exploratory_command()
+            commands = [ command.duplicate() for _ in range(self._env.num_envs) ]
+
+        # Reset
+        obss: VecEnvObs = self._env.reset()
+        for i, obs in enumerate(obss):
+            traj_states[i].append(self._preprocessor.transform(obs))
 
         while True:
-            if use_bf:
-                with torch.no_grad():
-                    action = self._action(state, self._create_command_tensor(command))
-            else:
-                action = torch.tensor(self._env.action_space.sample())
-
-            action = action.cpu().float()
-
-            next_state, reward, done, _ = self._env.step(action.numpy())
-            summed_reward += reward
+            actions_out = self._explore_act([ s[-1] for s in traj_states ] if use_bf else None,
+                                            commands if use_bf else None)
+            obss, rewards, dones, _infos = self._env.step(actions_out.numpy())
 
             if env_step_callback is not None:
                 env_step_callback(locals(), globals())
 
-            if add_to_replay_buffer:
-                states.append(state)
-                actions.append(action)
-                rewards.append(reward)
+            # Update trajectories and commands, check if done
+            for i, (obs, rew, done, action) in enumerate(zip(obss, rewards, dones, actions_out)):
+                traj_actions[i].append(action)
+                traj_rewards[i].append(rew)
 
-            state = self._preprocess_state_to_tensor(next_state)
+                # If episode is done, add to replay buffer, decrease counter, and return if finished
+                if done:
+                    if add_to_replay_buffer:
+                        t = Trajectory.create(traj_states[i], traj_actions[i], traj_rewards[i])
+                        summed_rewards.append(t.summed_rewards)
+                        self._replay_buffer.add_trajectories([ t ])
 
-            if use_bf:
-                command.update(reward, self._max_reward)
+                    # Return if enough episodes played
+                    num -= 1
 
-            if done:
-                break
+                    if progress:
+                        progress.update()
 
-        if add_to_replay_buffer:
-            self._replay_buffer.add(states, actions, rewards)
+                    if num <= 0:
+                        if progress:
+                            progress.close()
+                        return summed_rewards
 
-        return summed_reward
+                # Update command
+                if use_bf:
+                    if done:
+                        commands[i] = self._sample_exploratory_command()
+                    else:
+                        commands[i].update(rew, self._max_reward)
+
+                # Append new state, starting a new state-action-reward tuple
+                traj_states[i].append(self._preprocessor.transform(obs))
+
+    def _explore_act(self, states: Optional[List[Tensor]], commands: Optional[List[Command]]) -> Tensor:
+        """Returns actions for the given states. If inputs are None, it will sample random actions."""
+        if states is not None and commands is not None:
+            with torch.no_grad():
+                # Combine current states and commands into one stacked tensor each
+                actions_out = self._behavior.action(torch.stack(states),
+                                                    self._create_vec_command_tensor(commands))
+        else:
+            samples = np.array([ self._env.action_space.sample() for _ in range(self._env.num_envs) ])
+            actions_out = torch.tensor(samples)
+
+        return actions_out.cpu().float()
 
     def _run_upside_down(self, max_iterations: int, env_step_callback: Optional[EnvStepCallback] = None) -> TrainStats:
         """Algorithm 1 - Upside-Down Reinforcement Learning"""
@@ -254,13 +285,11 @@ class UDRL:
             stats.loss_history.append(bf_loss)
 
             logging.info("Exploring %s episodes...", self._n_episodes_per_iter)
-            for _ in tqdm.trange(self._n_episodes_per_iter):
-                self._generate_episode(True, True, env_step_callback=env_step_callback)
+            self._generate_episodes(self._n_episodes_per_iter, True, True, env_step_callback=env_step_callback)
 
             logging.info("Evaluating...")
+            ep_rewards = self._evaluate(env_step_callback)
             stats.command_history.append(self._evaluation_command)
-            ep_rewards = self._generate_episode(True, False, command=self._evaluation_command,
-                                                env_step_callback=env_step_callback)
             stats.reward_history.append(ep_rewards)
             average_100_reward = np.mean(stats.reward_history[-100:])
             stats.average_100_reward.append(average_100_reward)
@@ -276,60 +305,10 @@ class UDRL:
 
         return stats
 
-    def _action(self, obs: Tensor, command: Tensor, deterministic: bool = False) -> Tensor:
-        """Same as self.action() but works with Tensors and returns a tensor (in CPU memory)."""
-        # The input requires a batch dimension, so we add it using [None] indexing.
-        return self._behavior.action(obs[None], command[None], deterministic).cpu().squeeze().float()
-
     def _create_command_tensor(self, command: Command) -> Tensor:
         """Creates a command tensor."""
         return torch.tensor((command.reward * self._return_scale,
                              command.horizon * self._horizon_scale)).float()
 
-    def _preprocess_state_to_tensor(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> Tensor:
-        """Preprocess and convert an observation to torch.Tensor."""
-        t, _ = self._obs_to_tensor(obs)
-        t = preprocess_obs(t, self._obs_space)
-        return t
-
-    # Copied from stable_baselines3/common/policies.py: BaseModel
-    def _obs_to_tensor(self, observation: Union[np.ndarray, Dict[str, np.ndarray]]) -> Tuple[Tensor, bool]:
-        """
-        Convert an input observation to a PyTorch tensor that can be fed to a model.
-        Includes sugar-coating to handle different observations (e.g. normalizing images).
-
-        :param observation: the input observation
-        :return: The observation as PyTorch tensor
-            and whether the observation is vectorized or not
-        """
-        vectorized_env = False
-        if isinstance(observation, dict):
-            # need to copy the dict as the dict in VecFrameStack will become a torch tensor
-            observation = copy.deepcopy(observation)
-            for key, obs in observation.items():
-                obs_space = self._obs_space.spaces[key]  # pylint: disable=no-member
-                if is_image_space(obs_space):
-                    obs_ = maybe_transpose(obs, obs_space)
-                else:
-                    obs_ = np.array(obs)
-                vectorized_env = vectorized_env or is_vectorized_observation(obs_, obs_space)
-                # Add batch dimension if needed
-                observation[key] = obs_.reshape((-1,) + self._obs_space[key].shape)  # pylint: disable=unsubscriptable-object
-
-        elif is_image_space(self._obs_space):
-            # Handle the different cases for images
-            # as PyTorch use channel first format
-            observation = maybe_transpose(observation, self._obs_space)
-
-        else:
-            observation = np.array(observation)
-
-        if not isinstance(observation, dict):
-            # Dict obs need to be handled separately
-            vectorized_env = is_vectorized_observation(observation, self._obs_space)
-            # Add batch dimension if needed
-            # TODO: support vectorized environments
-            # observation = observation.reshape((-1,) + self._obs_space.shape)
-
-        observation = obs_as_tensor(observation, self._device)
-        return observation, vectorized_env  # type: ignore[return-value]
+    def _create_vec_command_tensor(self, commands: List[Command]) -> Tensor:
+        return torch.stack([ self._create_command_tensor(c) for c in commands ])
