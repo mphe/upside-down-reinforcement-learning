@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import pandas as pd
 import logging
 from typing import Any, Dict, Optional, List, Union, Callable
 import numpy as np
@@ -37,11 +38,14 @@ class Command:
         # This doesn't sound right, but the paper didn't mention anything about it.
         self.reward -= collected_reward
         if max_reward is not None:
-            self.reward = min(self.reward, max_reward)
+            self.reward = min(self.reward, max_reward)  # type: ignore[type-var]  # mypy is drunk
         self.horizon = max(self.horizon - 1, 1)
 
     def duplicate(self) -> "Command":
         return Command(self.reward, self.horizon)
+
+    def __str__(self) -> str:
+        return f"Reward: {self.reward:.2f}, Horizon: {self.horizon}"
 
 
 @dataclass
@@ -50,6 +54,15 @@ class TrainStats:
     loss_history: List[Float]
     average_100_reward: List[Float]
     command_history: List[Command]
+
+    def to_pandas(self) -> pd.DataFrame:
+        return pd.DataFrame({
+            "rewards": self.reward_history,
+            "loss": self.loss_history,
+            "average_100_reward": self.average_100_reward,
+            "command_horizon": [ c.horizon for c in self.command_history ],
+            "command_reward": [ c.reward for c in self.command_history ],
+        })
 
     def plot(self) -> None:
         from matplotlib import pyplot as plt
@@ -110,9 +123,13 @@ class UDRL:
         self._optimizer = optim.Adam(params=self._behavior.parameters())
         self._replay_buffer = ReplayBuffer(self._replay_size)
         self._preprocessor = Preprocessor(obs_space)
+        self._training_stats: TrainStats = TrainStats([], [], [], [])
 
         # This is set in _sample_exploratory_command()
         self._evaluation_command: Command = Command(1.0, 1)
+
+    def get_training_stats(self) -> TrainStats:
+        return self._training_stats
 
     def learn(self, max_iterations: int, skip_warmup: bool = False, env_step_callback: Optional[EnvStepCallback] = None) -> TrainStats:
         if not skip_warmup:
@@ -236,9 +253,13 @@ class UDRL:
 
                 # If episode is done, add to replay buffer, decrease counter, and return if finished
                 if done:
+                    t = Trajectory.create(traj_states[i], traj_actions[i], traj_rewards[i])
+                    summed_rewards.append(t.summed_rewards)
+                    traj_states[i].clear()
+                    traj_actions[i].clear()
+                    traj_rewards[i].clear()
+
                     if add_to_replay_buffer:
-                        t = Trajectory.create(traj_states[i], traj_actions[i], traj_rewards[i])
-                        summed_rewards.append(t.summed_rewards)
                         self._replay_buffer.add_trajectories([ t ])
 
                     # Return if enough episodes played
@@ -277,18 +298,19 @@ class UDRL:
 
     def _run_upside_down(self, max_iterations: int, env_step_callback: Optional[EnvStepCallback] = None) -> TrainStats:
         """Algorithm 1 - Upside-Down Reinforcement Learning"""
-        stats = TrainStats([], [], [], [])
+        stats = self._training_stats
 
         for train_iter in range(1, max_iterations + 1):
             logging.info("Training...")
             bf_loss = self._train_behavior_function()
-            stats.loss_history.append(bf_loss)
 
             logging.info("Exploring %s episodes...", self._n_episodes_per_iter)
             self._generate_episodes(self._n_episodes_per_iter, True, True, env_step_callback=env_step_callback)
 
             logging.info("Evaluating...")
             ep_rewards = self._evaluate(env_step_callback)
+
+            stats.loss_history.append(bf_loss)
             stats.command_history.append(self._evaluation_command)
             stats.reward_history.append(ep_rewards)
             average_100_reward = np.mean(stats.reward_history[-100:])
@@ -300,7 +322,8 @@ class UDRL:
 | Iteration: {train_iter}/{max_iterations}
 | Evaluated reward: {ep_rewards:.2f}
 | Mean 100 evaluated rewards: {average_100_reward:.2f}
-| Loss: {bf_loss:.2f}
+| Evaluation command: {self._evaluation_command}
+| Training loss: {bf_loss:.2f}
 |--------------------------------------------------""")
 
         return stats

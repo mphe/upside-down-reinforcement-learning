@@ -14,8 +14,10 @@ class Trajectory(NamedTuple):
 
     @classmethod
     def create(cls, states: List[Tensor], actions: List[Tensor], rewards: List[float]) -> "Trajectory":
+        """Should be used to create Trajectory objects instead of __init__()"""
         assert len(states) == len(actions) == len(rewards), "Inconsistent trajectory sizes"
-        return Trajectory(sum(rewards), states, actions, rewards)
+        # Make sure to make a copy to prevent accidental modifications
+        return Trajectory(sum(rewards), list(states), list(actions), list(rewards))
 
     def __len__(self) -> int:
         return len(self.rewards)
