@@ -144,7 +144,7 @@ class UDRL:
         commands. If deterministic is True, it returns the most likely actions."""
         return self._behavior.action(self._preprocessor.transform(obs),
                                      self._create_vec_command_tensor(commands),
-                                     deterministic).cpu().squeeze().float().numpy()
+                                     deterministic).cpu().float().numpy()
 
     def save(self, fname: str) -> None:
         torch.save(self._behavior.state_dict(), fname)
