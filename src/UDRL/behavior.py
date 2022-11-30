@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from typing import cast
+from typing import cast, Dict, Union, Tuple
 import logging
 import torch
 from torch import nn
@@ -9,10 +9,16 @@ from torch import Tensor
 import gym
 from stable_baselines3.common.torch_layers import NatureCNN
 from stable_baselines3.common.distributions import make_proba_distribution, Distribution
+from stable_baselines3.common.preprocessing import preprocess_obs
 
 
-# TODO: Move shared functionality from UDRLBehaviorCNN to base class
+# TODO: Move all shared functionality from UDRLBehaviorCNN to base class
 class UDRLBehavior(nn.Module):  # pylint: disable=abstract-method
+    def __init__(self, observation_space: gym.spaces.Space) -> None:
+        super().__init__()
+        self._observation_space: gym.spaces.Space = observation_space
+        assert not isinstance(observation_space, gym.spaces.Dict), "Dict observation space not supported"
+
     # Copied from stable_baselines3/common/policies.py: BaseModel
     @property
     def device(self) -> torch.device:
@@ -23,10 +29,16 @@ class UDRLBehavior(nn.Module):  # pylint: disable=abstract-method
             return param.device
         return torch.device("cpu")
 
+    def _preprocess(self, obs: Tensor, command: Tensor) -> Tuple[Tensor, Tensor]:
+        """Preprocesses a tensor and command and moves them to the desired device memory."""
+        # We can assume this is not a Dict.
+        return (cast(Tensor, preprocess_obs(obs, self._observation_space)).to(self.device),
+                command.to(self.device))
+
 
 class UDRLBehaviorCNN(UDRLBehavior):
     def __init__(self, observation_space: gym.spaces.Box, action_space: gym.spaces.Space, hidden_size: int = 256):
-        super().__init__()
+        super().__init__(observation_space)
 
         assert not isinstance(action_space, gym.spaces.Box), "Box action space is not supported"
 
@@ -51,9 +63,7 @@ class UDRLBehaviorCNN(UDRLBehavior):
 
     def forward(self, state: Tensor, command: Tensor) -> Tensor:
         """Runs a forward pass. Moves state and command tensors to the corresponding device memory."""
-        state = state.to(self.device)
-        command = command.to(self.device)
-
+        state, command = self._preprocess(state, command)
         out = self.model(state)
         out = self.bilinear(out, command)
         out = torch.relu(out)

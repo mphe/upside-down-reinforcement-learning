@@ -3,7 +3,8 @@
 
 import pandas as pd
 import logging
-from typing import Any, Dict, Optional, List, Union, Callable
+import copy
+from typing import Any, Dict, Optional, List, Union, Callable, Tuple
 import numpy as np
 import gym
 import torch
@@ -13,12 +14,13 @@ from torch.utils.data import DataLoader
 from dataclasses import dataclass
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvObs
+from stable_baselines3.common.preprocessing import is_image_space, maybe_transpose
+from stable_baselines3.common.utils import is_vectorized_observation, obs_as_tensor
 import tqdm
 
 from .behavior import UDRLBehaviorCNN
 from .replay_buffer import ReplayBuffer, Trajectory
 from .dataset import UDRLDataset
-from .preprocessing import Preprocessor
 
 EnvStepCallback = Callable[[Dict[str, Any], Dict[str, Any]], Any]
 
@@ -122,7 +124,6 @@ class UDRL:
         self._behavior = UDRLBehaviorCNN(obs_space, env.action_space, **policy_kwargs).to(self._device)
         self._optimizer = optim.Adam(params=self._behavior.parameters())
         self._replay_buffer = ReplayBuffer(self._replay_size)
-        self._preprocessor = Preprocessor(obs_space)
         self._training_stats: TrainStats = TrainStats([], [], [], [])
 
         # This is set in _sample_exploratory_command()
@@ -142,7 +143,7 @@ class UDRL:
     def action(self, obs: np.ndarray, commands: List[Command], deterministic: bool = False) -> np.ndarray:
         """Returns actions based on their predicted probabilities for the given observations and
         commands. If deterministic is True, it returns the most likely actions."""
-        return self._behavior.action(self._preprocessor.transform(obs),
+        return self._behavior.action(self._obs_to_tensor(obs),
                                      self._create_vec_command_tensor(commands),
                                      deterministic).cpu().float().numpy()
 
@@ -177,8 +178,6 @@ class UDRL:
 
         with tqdm.tqdm(total=self._n_updates_per_iter) as progress:
             for states, commands, actions in loader:
-                states = states.to(self._device)
-                commands = commands.to(self._device)
                 actions = actions.to(self._device)
 
                 y_pred = self._behavior(states, commands)  # pylint is drunk  # pylint: disable=not-callable
@@ -236,7 +235,7 @@ class UDRL:
         # Reset
         obss: VecEnvObs = self._env.reset()
         for i, obs in enumerate(obss):
-            traj_states[i].append(self._preprocessor.transform(obs))
+            traj_states[i].append(self._obs_to_tensor(obs))
 
         while True:
             actions_out = self._explore_act([ s[-1] for s in traj_states ] if use_bf else None,
@@ -281,7 +280,7 @@ class UDRL:
                         commands[i].update(rew, self._max_reward)
 
                 # Append new state, starting a new state-action-reward tuple
-                traj_states[i].append(self._preprocessor.transform(obs))
+                traj_states[i].append(self._obs_to_tensor(obs))
 
     def _explore_act(self, states: Optional[List[Tensor]], commands: Optional[List[Command]]) -> Tensor:
         """Returns actions for the given states. If inputs are None, it will sample random actions."""
@@ -335,3 +334,51 @@ class UDRL:
 
     def _create_vec_command_tensor(self, commands: List[Command]) -> Tensor:
         return torch.stack([ self._create_command_tensor(c) for c in commands ])
+
+    # Copied and slightly adapted from stable_baselines3/common/policies.py: BaseModel
+    # NOTE: This does not handle preprocessing, because we want to retain the original data type as
+    # far as possible to reduce memory usage. E.g. a normalized image observation (float) consumes
+    # four times more memory than the orignal (uint8).
+    # Hence, we do preprocessing in UDRLBehavior.forward()
+    def _obs_to_tensor(self, observation: Union[np.ndarray, Dict[str, np.ndarray]],
+                       add_batch_dimension: bool = False) -> Tensor:
+        """
+        Convert an input observation to a PyTorch tensor that can be fed to a model.
+
+        :param observation: the input observation
+        :return: The observation as PyTorch tensor
+        """
+        observation_space: gym.spaces.Space = self._env.observation_space
+
+        if isinstance(observation, dict):
+            # need to copy the dict as the dict in VecFrameStack will become a torch tensor
+            observation = copy.deepcopy(observation)
+            for key, obs in observation.items():
+                obs_space = observation_space.spaces[key]  # pylint: disable=no-member
+                if is_image_space(obs_space):
+                    obs_ = maybe_transpose(obs, obs_space)
+                else:
+                    obs_ = np.array(obs)
+                # Add batch dimension if needed
+                if add_batch_dimension:
+                    observation[key] = obs_.reshape((-1,) + observation_space[key].shape)  # pylint: disable=unsubscriptable-object
+
+        elif is_image_space(observation_space):
+            # Handle the different cases for images
+            # as PyTorch use channel first format
+            observation = maybe_transpose(observation, observation_space)
+
+        else:
+            observation = np.array(observation)
+
+        if not isinstance(observation, dict):
+            # Dict obs need to be handled separately
+            # Add batch dimension if needed
+            if add_batch_dimension:
+                observation = observation.reshape((-1,) + observation_space)
+
+        # NOTE: In our workflow we don't want to move the tensor to the GPU right away when this
+        # function gets called.
+        obs_tensor = obs_as_tensor(observation, "cpu")  # type: ignore[arg-type]
+        # NOTE: We don't support dict observations at the moment
+        return obs_tensor  # type: ignore[return-value]
