@@ -101,7 +101,8 @@ class UDRL:
                  only_trailing_segments: bool = True,
                  compress_replay_buffer: bool = False,
                  policy_kwargs: Optional[Dict[str, Any]] = None,
-                 device: Optional[str] = None):
+                 device: Optional[str] = None,
+                 learning_rate: float = 1e-3):
         self._horizon_scale = horizon_scale
         self._return_scale = return_scale
         self._replay_size = replay_size
@@ -125,7 +126,7 @@ class UDRL:
 
         policy_kwargs = {} if policy_kwargs is None else {}
         self._behavior = UDRLBehaviorCNN(obs_space, env.action_space, **policy_kwargs).to(self._device)
-        self._optimizer = optim.Adam(params=self._behavior.parameters())
+        self._optimizer = optim.Adam(params=self._behavior.parameters(), lr=learning_rate)
         self._replay_buffer = ReplayBuffer(self._replay_size, compress=compress_replay_buffer)
         self._training_stats: TrainStats = TrainStats([], [], [], [])
 
