@@ -4,7 +4,7 @@
 import pandas as pd
 import logging
 import copy
-from typing import Any, Dict, Optional, List, Union, Callable, Tuple
+from typing import Any, Dict, Optional, List, Union, Callable
 import numpy as np
 import gym
 import torch
@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvObs
 from stable_baselines3.common.preprocessing import is_image_space, maybe_transpose
-from stable_baselines3.common.utils import is_vectorized_observation, obs_as_tensor
+from stable_baselines3.common.utils import obs_as_tensor
 import tqdm
 
 from .behavior import UDRLBehaviorCNN
@@ -98,6 +98,8 @@ class UDRL:
                  last_few: int = 50,
                  batch_size: int = 256,
                  max_reward: Optional[float] = None,
+                 only_trailing_segments: bool = True,
+                 compress_replay_buffer: bool = False,
                  policy_kwargs: Optional[Dict[str, Any]] = None,
                  device: Optional[str] = None):
         self._horizon_scale = horizon_scale
@@ -109,6 +111,7 @@ class UDRL:
         self._last_few = last_few
         self._batch_size = batch_size
         self._max_reward = max_reward
+        self._only_trailing_segments = only_trailing_segments
 
         if not device:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -123,7 +126,7 @@ class UDRL:
         policy_kwargs = {} if policy_kwargs is None else {}
         self._behavior = UDRLBehaviorCNN(obs_space, env.action_space, **policy_kwargs).to(self._device)
         self._optimizer = optim.Adam(params=self._behavior.parameters())
-        self._replay_buffer = ReplayBuffer(self._replay_size)
+        self._replay_buffer = ReplayBuffer(self._replay_size, compress=compress_replay_buffer)
         self._training_stats: TrainStats = TrainStats([], [], [], [])
 
         # This is set in _sample_exploratory_command()
@@ -156,16 +159,28 @@ class UDRL:
     def _build_train_dataset(self, num: int) -> UDRLDataset:
         ds = UDRLDataset()
         episodes = self._replay_buffer.sample(num)
+        episodes.sort(key=id)  # Sort it by id, so that same trajectories are sorted together
+        uncompressed: Trajectory = None  # Store the current uncompressed trajectory
+        last_traj = None
 
         for ep in episodes:
-            # For episodic tasks only trailing segments are considered. See section 2.2.3.
+            if last_traj is not ep:
+                last_traj = ep
+                uncompressed = ep.uncompressed()
+
+            # The paper only considers trailing segments for episodic tasks, see section 2.2.3.
+            # We provide an option for that.
             eplength: int = len(ep)
             t1: int = np.random.randint(0, eplength - 1)
-            t2: int = eplength
+            t2: int
+            if self._only_trailing_segments:
+                t2 = eplength
+            else:
+                t2 = np.random.randint(t1 + 1, eplength + 1)  # +1 to not include low but include high
 
-            state = ep.states[t1]
-            command = Command(reward=sum(ep.rewards[t1:t2]), horizon=t2 - t1)
-            action = ep.actions[t1]
+            state = uncompressed.states[t1]
+            command = Command(reward=sum(uncompressed.rewards[t1:t2]), horizon=t2 - t1)
+            action = uncompressed.actions[t1]
 
             ds.add(state, self._create_command_tensor(command), action)
 
@@ -173,7 +188,7 @@ class UDRL:
 
     def _train_behavior_function(self) -> Float:
         ds = self._build_train_dataset(self._batch_size * self._n_updates_per_iter)
-        loader = DataLoader(ds, batch_size=self._batch_size, shuffle=False)
+        loader = DataLoader(ds, batch_size=self._batch_size, shuffle=True)
         losses: List[float] = []
 
         with tqdm.tqdm(total=self._n_updates_per_iter) as progress:
@@ -252,7 +267,7 @@ class UDRL:
 
                 # If episode is done, add to replay buffer, decrease counter, and return if finished
                 if done:
-                    t = Trajectory.create(traj_states[i], traj_actions[i], traj_rewards[i])
+                    t = Trajectory(traj_states[i], traj_actions[i], traj_rewards[i])
                     summed_rewards.append(t.summed_rewards)
                     traj_states[i].clear()
                     traj_actions[i].clear()
