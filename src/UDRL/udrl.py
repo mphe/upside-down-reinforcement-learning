@@ -196,9 +196,9 @@ class UDRL:
             for states, commands, actions in loader:
                 actions = actions.to(self._device)
 
+                self._optimizer.zero_grad()  # TODO: test with set_to_none=True
                 y_pred = self._behavior(states, commands)  # pylint is drunk  # pylint: disable=not-callable
-                self._optimizer.zero_grad(set_to_none=True)
-                pred_loss = F.cross_entropy(y_pred, actions)
+                pred_loss = -self._behavior.compute_loss(y_pred, actions).mean()
                 pred_loss.backward()
                 self._optimizer.step()
 
