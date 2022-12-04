@@ -19,7 +19,7 @@ from stable_baselines3.common.utils import obs_as_tensor
 import tqdm
 
 from .behavior import UDRLBehaviorCNN
-from .replay_buffer import ReplayBuffer, Trajectory
+from .replay_buffer import ReplayBuffer, BaseTrajectory, make_trajectory
 from .dataset import UDRLDataset
 
 EnvStepCallback = Callable[[Dict[str, Any], Dict[str, Any]], Any]
@@ -53,6 +53,7 @@ class Command:
 @dataclass
 class TrainStats:
     reward_history: List[float]
+    length_history: List[float]
     loss_history: List[Float]
     average_100_reward: List[Float]
     command_history: List[Command]
@@ -60,6 +61,7 @@ class TrainStats:
     def to_pandas(self) -> pd.DataFrame:
         return pd.DataFrame({
             "rewards": self.reward_history,
+            "lengths": self.length_history,
             "loss": self.loss_history,
             "average_100_reward": self.average_100_reward,
             "command_horizon": [ c.horizon for c in self.command_history ],
@@ -69,20 +71,23 @@ class TrainStats:
     def plot(self) -> None:
         from matplotlib import pyplot as plt
         plt.figure(figsize=(15, 8))
-        plt.subplot(2, 2, 1)
+        plt.subplot(3, 2, 1)
         plt.title("Rewards")
         plt.plot(self.reward_history, label="rewards")
         plt.plot(self.average_100_reward, label="average100")
         plt.legend()
-        plt.subplot(2, 2, 2)
+        plt.subplot(3, 2, 2)
         plt.title("Loss")
         plt.plot(self.loss_history)
-        plt.subplot(2, 2, 3)
+        plt.subplot(3, 2, 3)
         plt.title("desired Rewards")
         plt.plot([ i.reward for i in self.command_history ])
-        plt.subplot(2, 2, 4)
+        plt.subplot(3, 2, 4)
         plt.title("desired Horizon")
         plt.plot([ i.horizon for i in self.command_history ])
+        plt.subplot(3, 2, 5)
+        plt.title("Episode Lengths")
+        plt.plot(self.length_history, label="episode length")
         plt.show()
 
 
@@ -102,6 +107,7 @@ class UDRL:
                  compress_replay_buffer: bool = False,
                  policy_kwargs: Optional[Dict[str, Any]] = None,
                  device: Optional[str] = None,
+                 weighted_replay_sampling: bool = False,
                  learning_rate: float = 1e-3):
         self._horizon_scale = horizon_scale
         self._return_scale = return_scale
@@ -113,6 +119,8 @@ class UDRL:
         self._batch_size = batch_size
         self._max_reward = max_reward
         self._only_trailing_segments = only_trailing_segments
+        self._compress_replay_buffer = compress_replay_buffer
+        self._weighted_replay_sampling = weighted_replay_sampling
 
         if not device:
             device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -128,7 +136,7 @@ class UDRL:
         self._behavior = UDRLBehaviorCNN(obs_space, env.action_space, **policy_kwargs).to(self._device)
         self._optimizer = optim.Adam(params=self._behavior.parameters(), lr=learning_rate)
         self._replay_buffer = ReplayBuffer(self._replay_size, compress=compress_replay_buffer)
-        self._training_stats: TrainStats = TrainStats([], [], [], [])
+        self._training_stats: TrainStats = TrainStats([], [], [], [], [])
 
         # This is set in _sample_exploratory_command()
         self._evaluation_command: Command = Command(1.0, 1)
@@ -159,9 +167,9 @@ class UDRL:
 
     def _build_train_dataset(self, num: int) -> UDRLDataset:
         ds = UDRLDataset()
-        episodes = self._replay_buffer.sample(num)
+        episodes = self._replay_buffer.sample(num, weighted=self._weighted_replay_sampling)
         episodes.sort(key=id)  # Sort it by id, so that same trajectories are sorted together
-        uncompressed: Trajectory = None  # Store the current uncompressed trajectory
+        uncompressed: BaseTrajectory = None  # Store the current uncompressed trajectory
         last_traj = None
 
         for ep in episodes:
@@ -224,12 +232,12 @@ class UDRL:
 
         return Command(new_desired_reward, new_desired_horizon)
 
-    def _evaluate(self, env_step_callback: Optional[EnvStepCallback] = None) -> float:
+    def _evaluate(self, env_step_callback: Optional[EnvStepCallback] = None) -> BaseTrajectory:
         return self._generate_episodes(1, True, False, self._evaluation_command, env_step_callback)[0]
 
     def _generate_episodes(self, num: int, use_bf: bool, add_to_replay_buffer: bool,
                            command: Optional[Command] = None,
-                           env_step_callback: Optional[EnvStepCallback] = None) -> List[float]:
+                           env_step_callback: Optional[EnvStepCallback] = None) -> List[BaseTrajectory]:
         """Plays N episodes using random actions or the behavior function and optionally adds it to the replay buffer."""
         # NOTE: This function got a bit large and complicated, but it's still more clear and
         # readable than any attempts of refactoring it.
@@ -239,7 +247,7 @@ class UDRL:
         traj_states: List[List[Tensor]] = [ [] for _ in range(self._env.num_envs) ]
         traj_actions: List[List[Tensor]] = [ [] for _ in range(self._env.num_envs) ]
         traj_rewards: List[List[float]] = [ [] for _ in range(self._env.num_envs) ]
-        summed_rewards: List[float] = []
+        trajectories: List[BaseTrajectory] = []
         progress: Optional[tqdm.tqdm] = tqdm.tqdm(total=num) if num > 1 else None
 
         # Initialize commands
@@ -268,8 +276,8 @@ class UDRL:
 
                 # If episode is done, add to replay buffer, decrease counter, and return if finished
                 if done:
-                    t = Trajectory(traj_states[i], traj_actions[i], traj_rewards[i])
-                    summed_rewards.append(t.summed_rewards)
+                    t = make_trajectory(traj_states[i], traj_actions[i], traj_rewards[i], self._compress_replay_buffer)
+                    trajectories.append(t)
                     traj_states[i].clear()
                     traj_actions[i].clear()
                     traj_rewards[i].clear()
@@ -286,7 +294,7 @@ class UDRL:
                     if num <= 0:
                         if progress:
                             progress.close()
-                        return summed_rewards
+                        return trajectories
 
                 # Update command
                 if use_bf:
@@ -323,11 +331,12 @@ class UDRL:
             self._generate_episodes(self._n_episodes_per_iter, True, True, env_step_callback=env_step_callback)
 
             logging.info("Evaluating...")
-            ep_rewards = self._evaluate(env_step_callback)
+            t_eval = self._evaluate(env_step_callback)
 
             stats.loss_history.append(bf_loss)
             stats.command_history.append(self._evaluation_command)
-            stats.reward_history.append(ep_rewards)
+            stats.reward_history.append(t_eval.summed_rewards)
+            stats.length_history.append(len(t_eval))
             average_100_reward = np.mean(stats.reward_history[-100:])
             stats.average_100_reward.append(average_100_reward)
 
@@ -335,7 +344,8 @@ class UDRL:
             logging.info(f"""
 |--------------------------------------------------
 | Iteration: {train_iter}/{max_iterations}
-| Evaluated reward: {ep_rewards:.2f}
+| Evaluated reward: {t_eval.summed_rewards:.2f}
+| Evaluated episode length: {len(t_eval)}
 | Mean 100 evaluated rewards: {average_100_reward:.2f}
 | Evaluation command: {self._evaluation_command}
 | Training loss: {bf_loss:.2f}

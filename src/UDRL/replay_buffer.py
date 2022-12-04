@@ -138,6 +138,11 @@ class Trajectory(BaseTrajectory):
         return self.rewards.size
 
 
+def make_trajectory(states: List[Tensor], actions: List[Tensor], rewards: Sequence[float], compressed: bool) -> BaseTrajectory:
+    t = Trajectory(states, actions, rewards)
+    return t.compressed() if compressed else t
+
+
 class ReplayBuffer:
     def __init__(self, max_size: int, compress: bool = False) -> None:
         self._max_size: int = max_size
@@ -167,8 +172,11 @@ class ReplayBuffer:
         """Returns K episodes with highest total episode rewards in descending order."""
         return self._buffer[:k]
 
-    def sample(self, k: int) -> List[BaseTrajectory]:
-        """Returns K randomly selected episodes."""
+    def sample(self, k: int, weighted: bool = False) -> List[BaseTrajectory]:
+        """Returns K randomly selected episodes. If weighted is True, episode selection is weighted
+        based on their length."""
+        if weighted:
+            return random.choices(self._buffer, k=k, weights=[ len(t) for t in self._buffer ])
         return random.choices(self._buffer, k=k)
 
     def __len__(self) -> int:
