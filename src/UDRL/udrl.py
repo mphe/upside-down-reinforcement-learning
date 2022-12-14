@@ -4,7 +4,7 @@
 import pandas as pd
 import logging
 import copy
-from typing import Any, Dict, Optional, List, Union, Callable
+from typing import Any, Dict, Optional, List, Union, Callable, Tuple
 import numpy as np
 import gym
 import torch
@@ -204,9 +204,10 @@ class UDRL:
             for states, commands, actions in loader:
                 actions = actions.to(self._device)
 
-                self._optimizer.zero_grad()  # TODO: test with set_to_none=True
                 y_pred = self._behavior(states, commands)  # pylint is drunk  # pylint: disable=not-callable
-                pred_loss = -self._behavior.compute_loss(y_pred, actions).mean()
+                pred_loss = F.cross_entropy(y_pred, actions)
+                # pred_loss = self._behavior.compute_loss(y_pred, actions).mean()
+                self._optimizer.zero_grad()  # TODO: test with set_to_none=True
                 pred_loss.backward()
                 self._optimizer.step()
 
@@ -232,8 +233,14 @@ class UDRL:
 
         return Command(new_desired_reward, new_desired_horizon)
 
-    def _evaluate(self, env_step_callback: Optional[EnvStepCallback] = None) -> BaseTrajectory:
-        return self._generate_episodes(1, True, False, self._evaluation_command, env_step_callback)[0]
+    def _evaluate(self, n_episodes: int, env_step_callback: Optional[EnvStepCallback] = None) -> Tuple[float, float]:
+        """Runs evaluation on multiple environments and returns the average reward and horizon"""
+        eps =  self._generate_episodes(n_episodes, True, False, self._evaluation_command, env_step_callback)
+
+        eval_return = np.mean([ e.summed_rewards for e in eps ] )
+        eval_horizon = np.mean([ len(e) for e in eps ])
+        return eval_return, eval_horizon
+
 
     def _generate_episodes(self, num: int, use_bf: bool, add_to_replay_buffer: bool,
                            command: Optional[Command] = None,
@@ -311,13 +318,11 @@ class UDRL:
         if states is not None and commands is not None:
             with torch.no_grad():
                 # Combine current states and commands into one stacked tensor each
-                actions_out = self._behavior.action(torch.stack(states),
-                                                    self._create_vec_command_tensor(commands))
+                return self._behavior.action(
+                    torch.stack(states), self._create_vec_command_tensor(commands)).cpu()
         else:
             samples = np.array([ self._env.action_space.sample() for _ in range(self._env.num_envs) ])
-            actions_out = torch.tensor(samples)
-
-        return actions_out.cpu().float()
+            return torch.tensor(samples)
 
     def _run_upside_down(self, max_iterations: int, env_step_callback: Optional[EnvStepCallback] = None) -> TrainStats:
         """Algorithm 1 - Upside-Down Reinforcement Learning"""
@@ -331,12 +336,12 @@ class UDRL:
             self._generate_episodes(self._n_episodes_per_iter, True, True, env_step_callback=env_step_callback)
 
             logging.info("Evaluating...")
-            t_eval = self._evaluate(env_step_callback)
+            eval_reward, eval_horizon = self._evaluate(self._env.num_envs, env_step_callback)
 
             stats.loss_history.append(bf_loss)
             stats.command_history.append(self._evaluation_command)
-            stats.reward_history.append(t_eval.summed_rewards)
-            stats.length_history.append(len(t_eval))
+            stats.reward_history.append(eval_reward)
+            stats.length_history.append(eval_horizon)
             average_100_reward = np.mean(stats.reward_history[-100:])
             stats.average_100_reward.append(average_100_reward)
 
@@ -344,8 +349,8 @@ class UDRL:
             logging.info(f"""
 |--------------------------------------------------
 | Iteration: {train_iter}/{max_iterations}
-| Evaluated reward: {t_eval.summed_rewards:.2f}
-| Evaluated episode length: {len(t_eval)}
+| Avg. evaluated reward: {eval_reward:.2f}
+| Avg. evaluated episode length: {eval_horizon}
 | Mean 100 evaluated rewards: {average_100_reward:.2f}
 | Evaluation command: {self._evaluation_command}
 | Training loss: {bf_loss:.2f}

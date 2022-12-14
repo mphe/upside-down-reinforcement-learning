@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from typing import cast, Dict, Union, Tuple
+from typing import cast, Tuple
 import logging
 import torch
 from torch import nn
@@ -73,17 +73,43 @@ class UDRLBehaviorCNN(UDRLBehavior):
     def __init__(self, observation_space: gym.spaces.Box, action_space: gym.spaces.Space, hidden_size: int = 256):
         super().__init__(observation_space, action_space, hidden_size)
 
-        self.model = nn.Sequential(
-            NatureCNN(observation_space, hidden_size),  # Includes one fc layer + relu
-            self.action_net,  # second fc layer
+        # NatureCNN (copied and adaptedfrom stable baselines 3)
+        self.cnn = nn.Sequential(
+            nn.Conv2d(observation_space.shape[0], 32, kernel_size=8, stride=4, padding=0),
+            nn.BatchNorm2d(32),
             nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Flatten(),
         )
+
+        # Compute CNN output shape by doing one forward pass
+        with torch.no_grad():
+            n_flatten = self.cnn(torch.as_tensor(observation_space.sample()[None]).float()).shape[1]
+
+        self.model = nn.Sequential(
+            # NatureCNN(observation_space, hidden_size),  # Includes one fc layer + relu
+            self.cnn,
+            nn.Linear(n_flatten, hidden_size),
+            nn.ReLU(),
+            self.action_net,  # second fc layer
+            # nn.ReLU(),
+            nn.Tanh()
+        )
+
         self.bilinear = nn.Bilinear(self.get_action_space_size(), 2, self.get_action_space_size())
+        # self.bilinear = nn.Bilinear(self.action, 2, hidden_size)
 
     def forward(self, state: Tensor, command: Tensor) -> Tensor:
         """Runs a forward pass. Moves state and command tensors to the corresponding device memory."""
         state, command = self._preprocess(state, command)
         out = self.model(state)
-        out = self.bilinear(out, command)
-        out = torch.relu(out)
+        # out = self.action_net(out)  # out
+        # out = torch.tanh(out)
+        out = self.bilinear(out, command)  # second fc
+        # out = torch.relu(out)
         return out
