@@ -18,7 +18,7 @@ from stable_baselines3.common.preprocessing import is_image_space, maybe_transpo
 from stable_baselines3.common.utils import obs_as_tensor
 import tqdm
 
-from .behavior import UDRLBehaviorCNN
+from .behavior import UDRLBehaviorCNN, UDRLBehavior, UDRLBehaviorMLP
 from .replay_buffer import ReplayBuffer, BaseTrajectory, make_trajectory
 from .dataset import UDRLDataset
 
@@ -94,6 +94,7 @@ class TrainStats:
 class UDRL:
     def __init__(self,
                  env: Union[gym.Env, VecEnv],
+                 behavior: str = "mlp",
                  horizon_scale: float = 0.02,
                  return_scale: float = 0.02,
                  replay_size: int = 700,
@@ -128,12 +129,24 @@ class UDRL:
 
         # Transform the environment to a vectorized environment and wrap VecTransposeImage for image observations
         self._env: VecEnv = BaseAlgorithm._wrap_env(env, verbose=1)
+        assert isinstance(self._env.action_space, gym.spaces.Discrete), "Only discrete action spaces are supported at the moment"
 
         obs_space: gym.spaces.Space = self._env.observation_space
         logging.debug("Observation space: %s", obs_space.shape)
 
         policy_kwargs = {} if policy_kwargs is None else {}
-        self._behavior = UDRLBehaviorCNN(obs_space, env.action_space, **policy_kwargs).to(self._device)
+
+        self._behavior: UDRLBehavior
+
+        if behavior == "mlp":
+            self._behavior = UDRLBehaviorMLP(obs_space, self._env.action_space, **policy_kwargs)
+        elif behavior == "cnn":
+            self._behavior = UDRLBehaviorCNN(obs_space, self._env.action_space, **policy_kwargs)
+        else:
+            raise ValueError("Invalid behavior net type")
+
+        self._behavior = self._behavior.to(self._device)
+
         self._optimizer = optim.Adam(params=self._behavior.parameters(), lr=learning_rate)
         self._replay_buffer = ReplayBuffer(self._replay_size, compress=compress_replay_buffer)
         self._training_stats: TrainStats = TrainStats([], [], [], [], [])
@@ -204,10 +217,13 @@ class UDRL:
             for states, commands, actions in loader:
                 actions = actions.to(self._device)
 
-                y_pred = self._behavior(states, commands)  # pylint is drunk  # pylint: disable=not-callable
-                pred_loss = F.cross_entropy(y_pred, actions)
-                # pred_loss = self._behavior.compute_loss(y_pred, actions).mean()
                 self._optimizer.zero_grad()  # TODO: test with set_to_none=True
+                y_pred = self._behavior(states, commands)  # pylint is drunk  # pylint: disable=not-callable
+                # TODO: This should work, but doesn't. The loss increases very fast, indefinitely.
+                # For now, only cross_entropy is supported, thus only discrete action spaces.
+                # pred_loss = self._behavior.compute_loss(y_pred, actions).mean()
+                pred_loss = F.cross_entropy(y_pred, actions)
+
                 pred_loss.backward()
                 self._optimizer.step()
 
@@ -235,12 +251,11 @@ class UDRL:
 
     def _evaluate(self, n_episodes: int, env_step_callback: Optional[EnvStepCallback] = None) -> Tuple[float, float]:
         """Runs evaluation on multiple environments and returns the average reward and horizon"""
-        eps =  self._generate_episodes(n_episodes, True, False, self._evaluation_command, env_step_callback)
+        eps = self._generate_episodes(n_episodes, True, False, self._evaluation_command, env_step_callback)
 
         eval_return = np.mean([ e.summed_rewards for e in eps ] )
         eval_horizon = np.mean([ len(e) for e in eps ])
-        return eval_return, eval_horizon
-
+        return eval_return, eval_horizon  # type: ignore[return-value]
 
     def _generate_episodes(self, num: int, use_bf: bool, add_to_replay_buffer: bool,
                            command: Optional[Command] = None,
