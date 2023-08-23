@@ -24,6 +24,8 @@ from .dataset import UDRLDataset
 
 EnvStepCallback = Callable[[Dict[str, Any], Dict[str, Any]], Any]
 
+ObsType = Union[np.ndarray, Dict[str, np.ndarray]]
+
 # mypy complains about np.floating not being compatible to basic python floats
 Float = Union[float, np.floating]
 
@@ -165,9 +167,16 @@ class UDRL:
 
         return self._run_upside_down(max_iterations, env_step_callback)
 
-    def action(self, obs: np.ndarray, commands: List[Command], deterministic: bool = False) -> np.ndarray:
+    def action(self, obs: VecEnvObs, commands: List[Command], deterministic: bool = False) -> np.ndarray:
         """Returns actions based on their predicted probabilities for the given observations and
         commands. If deterministic is True, it returns the most likely actions."""
+
+        # Accept VecEnvObs arguments, then filter them here, to prevent linter errors on user side
+        if isinstance(obs, dict):
+            assert False, "Dict observations are not supported at the moment"
+        if isinstance(obs, tuple):
+            assert False, "Tuple observations are not supported at the moment"
+
         return self._behavior.action(self._obs_to_tensor(obs),
                                      self._create_vec_command_tensor(commands),
                                      deterministic).cpu().float().numpy()
@@ -386,7 +395,7 @@ class UDRL:
     # far as possible to reduce memory usage. E.g. a normalized image observation (float) consumes
     # four times more memory than the orignal (uint8).
     # Hence, we do preprocessing in UDRLBehavior.forward()
-    def _obs_to_tensor(self, observation: Union[np.ndarray, Dict[str, np.ndarray]],
+    def _obs_to_tensor(self, observation: ObsType,
                        add_batch_dimension: bool = False) -> Tensor:
         """
         Convert an input observation to a PyTorch tensor that can be fed to a model.
