@@ -70,26 +70,48 @@ class TrainStats:
             "command_reward": [ c.reward for c in self.command_history ],
         })
 
+    @staticmethod
+    def from_pandas(df: pd.DataFrame) -> "TrainStats":
+        return TrainStats(df["rewards"], df["lengths"], df["loss"], df["average_100_reward"],
+                          [ Command(r, h) for r, h in zip(df["command_reward"], df["command_horizon"]) ])
+
     def plot(self) -> None:
         from matplotlib import pyplot as plt
-        plt.figure(figsize=(15, 8))
+        plt.figure(figsize=(8, 8))
+
         plt.subplot(3, 2, 1)
-        plt.title("Rewards")
-        plt.plot(self.reward_history, label="rewards")
-        plt.plot(self.average_100_reward, label="average100")
+        plt.title("Evaluation Reward")
+        plt.plot(self.reward_history, label="Rewards")
+        plt.plot(self.average_100_reward, label="Average 100")
+        plt.xlabel("Iteration")
+        plt.ylabel("Reward")
         plt.legend()
+
         plt.subplot(3, 2, 2)
-        plt.title("Loss")
+        plt.title("Training Loss")
         plt.plot(self.loss_history)
+        plt.xlabel("Iteration")
+        plt.ylabel("Loss")
+
         plt.subplot(3, 2, 3)
-        plt.title("desired Rewards")
+        plt.title("Desired Reward")
         plt.plot([ i.reward for i in self.command_history ])
+        plt.xlabel("Iteration")
+        plt.ylabel("Reward")
+
         plt.subplot(3, 2, 4)
-        plt.title("desired Horizon")
+        plt.title("Desired Horizon")
         plt.plot([ i.horizon for i in self.command_history ])
+        plt.xlabel("Iteration")
+        plt.ylabel("Horizon")
+
         plt.subplot(3, 2, 5)
-        plt.title("Episode Lengths")
-        plt.plot(self.length_history, label="episode length")
+        plt.title("Mean Episode Length")
+        plt.plot(self.length_history)
+        plt.xlabel("Iteration")
+        plt.ylabel("Length")
+
+        plt.tight_layout()
         plt.show()
 
 

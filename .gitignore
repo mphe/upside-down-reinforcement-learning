@@ -5,3 +5,4 @@
 .python-version
 .vim-bookmarks
 .vim
+*.pt
