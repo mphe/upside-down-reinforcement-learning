@@ -179,7 +179,7 @@ class UDRL:
 
         return self._behavior.action(self._obs_to_tensor(obs),
                                      self._create_vec_command_tensor(commands),
-                                     deterministic).cpu().float().numpy()
+                                     deterministic).cpu().numpy()
 
     def save(self, fname: str) -> None:
         torch.save(self._behavior.state_dict(), fname)
