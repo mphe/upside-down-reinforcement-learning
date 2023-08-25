@@ -6,7 +6,7 @@ import logging
 import copy
 from typing import Any, Dict, Optional, List, Union, Callable, Tuple
 import numpy as np
-import gym
+import gymnasium as gym
 import torch
 import torch.nn.functional as F
 from torch import Tensor, optim

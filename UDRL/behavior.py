@@ -6,7 +6,7 @@ import logging
 import torch
 from torch import nn
 from torch import Tensor
-import gym
+import gymnasium as gym
 from stable_baselines3.common.torch_layers import FlattenExtractor, create_mlp
 from stable_baselines3.common.distributions import make_proba_distribution, Distribution
 from stable_baselines3.common.preprocessing import preprocess_obs
