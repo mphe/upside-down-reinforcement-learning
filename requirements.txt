@@ -1,4 +1,4 @@
 gymnasium==0.29.1
 stable-baselines3==2.1.0
-torch==2.2.0
+torch==2.7.0
 tqdm==4.66.3
